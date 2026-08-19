@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: YourCloudDude learner project for an event-driven image-processing pipeline.
+
+Parameters:
+  UploadBucketName:
+    Type: String
+    Description: Globally unique S3 bucket name for source image uploads.
+  ProcessedBucketName:
+    Type: String
+    Description: Globally unique S3 bucket name for processed image output.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    MemorySize: 512
+    Timeout: 30
+    Tracing: Active
+    Environment:
+      Variables:
+        OUTPUT_BUCKET: !Ref ProcessedBucketName
+        MAX_DIMENSION: '1024'
+        MAX_IMAGE_BYTES: '10485760'
+
+Resources:
+  ImageDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  ImageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  ImageQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ImageQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowUploadBucketEvents
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ImageQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:s3:::${UploadBucketName}
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ImageQueuePolicy
+    Properties:
+      BucketName: !Ref UploadBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ImageQueue.Arn
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ProcessedBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ImageProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadBucketName
+        - S3ReadPolicy:
+            BucketName: !Ref ProcessedBucketName
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedBucketName
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ImageQueue.QueueName
+      Events:
+        ImageQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 5
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Image-processing messages are visible in the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ImageDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  UploadBucketName:
+    Description: Upload images to this bucket to start the pipeline.
+    Value: !Ref UploadBucket
+  ProcessedBucketName:
+    Description: Processed JPEG images are written to this bucket.
+    Value: !Ref ProcessedBucket
+  ImageQueueUrl:
+    Description: SQS queue that buffers S3 image events.
+    Value: !Ref ImageQueue
+  DeadLetterQueueUrl:
+    Description: Failed messages are moved here after retries are exhausted.
+    Value: !Ref ImageDeadLetterQueue
+  ImageProcessorFunctionName:
+    Description: Lambda function that processes queued image events.
+    Value: !Ref ImageProcessorFunction
