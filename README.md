@@ -25,6 +25,7 @@ By building and reading this project, you should be able to explain:
 - how source ETags can be used to avoid unnecessary duplicate processing
 - how IAM permissions map to each step of the data flow
 - where backpressure appears when uploads outpace processing
+- how byte and decoded-pixel limits protect a memory-bound image worker
 - which AWS resources create cost and how to clean them up
 
 ## Architecture
@@ -62,10 +63,24 @@ The trade-off is additional latency, another service to operate, and SQS request
 4. The function decodes the S3 event contained in each SQS message.
 5. Unsupported file extensions are ignored rather than retried forever.
 6. For supported images, Lambda checks whether the deterministic output already exists for the same source ETag.
-7. If work is needed, Lambda downloads the image, validates its size, resizes it while preserving aspect ratio, converts it to JPEG, and uploads the result to the processed bucket.
-8. Successful SQS messages are deleted by the event-source mapping.
-9. Failed messages are returned through partial-batch failure reporting and retried.
-10. Messages that exceed the queue retry policy move to the DLQ.
+7. If work is needed, Lambda downloads the image and enforces both compressed-byte and decoded-pixel limits before fully loading it into memory.
+8. The image is resized while preserving aspect ratio, converted to JPEG, and uploaded to the processed bucket.
+9. Successful SQS messages are deleted by the event-source mapping.
+10. Failed messages are returned through partial-batch failure reporting and retried.
+11. Messages that exceed the queue retry policy move to the DLQ.
+
+## Image Safety Limits
+
+Compressed file size alone is not enough to protect an image worker. A relatively small compressed image can decode into a very large pixel buffer and consume far more memory than its object size suggests.
+
+This project therefore applies two independent limits before processing completes:
+
+- `MAX_IMAGE_BYTES`: maximum source payload size, default **10 MiB**
+- `MAX_IMAGE_PIXELS`: maximum decoded dimensions multiplied together, default **20,000,000 pixels**
+
+The pixel limit is checked immediately after Pillow reads the image header and before `source.load()` decodes the full image. Inputs above either limit fail the SQS message and follow the normal retry/DLQ path.
+
+These defaults are teaching safeguards, not universal production values. Tune them against Lambda memory, expected image formats, workload characteristics, and the failure policy of the real system.
 
 ## Idempotency Strategy
 
@@ -196,7 +211,8 @@ The queue uses a retry policy before moving repeatedly failing messages to the D
 Examples of failures that can reach the DLQ include:
 
 - corrupt image bytes
-- images above the configured size limit
+- images above the configured byte-size limit
+- images above the configured decoded-pixel limit
 - temporary S3 permission/configuration errors
 - unexpected processor exceptions
 
@@ -206,7 +222,7 @@ The template also creates a CloudWatch alarm that enters the `ALARM` state when 
 
 ## Security Notes
 
-The template is intentionally conservative:
+The template and processor are intentionally conservative:
 
 - both buckets block public access
 - S3 server-side encryption is enabled
@@ -215,6 +231,7 @@ The template is intentionally conservative:
 - Lambda receives read access only to the upload bucket
 - Lambda receives read/write access only to the processed bucket
 - Lambda receives SQS polling permissions only for the image queue
+- compressed-byte and decoded-pixel limits reduce memory-exhaustion risk from hostile or pathological images
 - no application secrets are stored in the repository
 
 Before adapting this pattern for a real product, consider malware scanning, stricter content validation, object ownership requirements, KMS key policies, lifecycle policies, access logging, alarms with notification targets, and account-level guardrails.
@@ -285,8 +302,8 @@ After completing the project, try answering these without reading the code:
 5. Why can duplicate processing happen in an event-driven system?
 6. How does this project reduce the impact of duplicate S3 events?
 7. What happens if image uploads arrive faster than Lambda can process them?
-8. Which IAM permissions does Lambda actually need?
-9. How would you detect a growing processing backlog?
+8. Why is a compressed-byte limit insufficient for image-processing safety?
+9. Which IAM permissions does Lambda actually need?
 10. What would you change before adapting this design for sensitive user uploads?
 
 ## About YourCloudDude

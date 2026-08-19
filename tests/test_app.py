@@ -138,6 +138,19 @@ def test_oversized_image_is_reported_as_batch_failure(monkeypatch: pytest.Monkey
     assert fake.put_calls == []
 
 
+def test_excessive_pixel_count_is_reported_as_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app, "MAX_IMAGE_PIXELS", 10_000)
+    fake = FakeS3(image_bytes(101, 101))
+    monkeypatch.setattr(app, "get_s3_client", lambda: fake)
+
+    result = app.handler({"Records": [sqs_record(message_id="too-many-pixels")]}, None)
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "too-many-pixels"}]}
+    assert fake.put_calls == []
+
+
 def test_malformed_message_is_reported_as_batch_failure() -> None:
     result = app.handler(
         {"Records": [sqs_record(message_id="bad-json", body="not-json")]},
