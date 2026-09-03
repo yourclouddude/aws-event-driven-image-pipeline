@@ -23,7 +23,7 @@ sequenceDiagram
         Worker-->>Queue: success
     else processing required
         Worker->>Upload: GetObject source image
-        Worker->>Worker: validate and resize
+        Worker->>Worker: validate bytes, pixels, resize
         Worker->>Output: PutObject JPEG + metadata
         Worker-->>Queue: success
     end
@@ -66,9 +66,9 @@ For workflows that require stronger coordination, a DynamoDB processing ledger o
 
 The message is acknowledged and skipped. Retrying a `.txt` object will never turn it into a supported image.
 
-### Corrupt image or oversized payload
+### Corrupt image or unsafe image size
 
-The message fails and is retried. Repeated failure eventually sends it to the DLQ so the bad input becomes inspectable rather than silently disappearing.
+The processor enforces both a compressed-byte limit and a decoded-pixel limit. The byte check prevents oversized objects from being loaded, while the pixel check prevents a small compressed image from expanding into an unexpectedly large in-memory bitmap. Violations fail the message and eventually become inspectable in the DLQ if retries keep failing.
 
 ### Temporary S3 or Lambda failure
 

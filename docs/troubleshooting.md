@@ -38,10 +38,13 @@ A race can still cause duplicate work if two matching events execute before the 
 Inspect the Lambda logs and the source object. Common causes include:
 
 - corrupt image content
-- payload larger than the configured 10 MiB limit
+- payload larger than the configured 10 MiB byte limit
+- decoded dimensions above the configured 20,000,000-pixel limit
 - S3 access failure
 - invalid processor configuration
 - a library/runtime packaging problem
+
+The byte and pixel checks solve different problems: compressed object size controls download/memory input, while the pixel limit prevents a small compressed image from expanding into an unexpectedly large decoded buffer.
 
 After fixing the cause, redrive messages deliberately rather than deleting the DLQ blindly.
 
@@ -49,7 +52,7 @@ After fixing the cause, redrive messages deliberately rather than deleting the D
 
 The function timeout is 30 seconds and the SQS visibility timeout is 180 seconds. Very large or complex images may still exceed the function's practical processing budget.
 
-Consider reducing accepted image size, increasing memory, profiling processing time, or splitting workflows based on input size. Do not simply raise timeouts without understanding the cost and retry impact.
+Consider reducing accepted image size or pixel count, increasing memory, profiling processing time, or splitting workflows based on input size. Do not simply raise timeouts without understanding the cost and retry impact.
 
 ## `sam build` fails while installing Pillow
 

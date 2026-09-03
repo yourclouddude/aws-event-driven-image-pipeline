@@ -1,31 +1,16 @@
 # AWS Event-Driven Image Pipeline
 
-A **YourCloudDude** learner project for understanding how to build a resilient event-driven image-processing workflow on AWS.
+Upload an image to S3, let the work wait safely in SQS, process it with Lambda, and make failures visible instead of pretending they never happen.
 
-> Upload an image. Buffer the event. Process it asynchronously. Make failures visible.
+This is a **YourCloudDude** project for learning event-driven AWS architecture by building a small system you can actually reason about.
 
-This project intentionally focuses on a small set of services and the engineering decisions between them:
+The obvious version of this project is:
 
-- **Amazon S3** for source and processed images
-- **Amazon SQS** for buffering and retry isolation
-- **AWS Lambda** for image processing
-- **Amazon CloudWatch** for logs, metrics, and a DLQ alarm
-- **AWS IAM** for least-privilege access
-- **AWS SAM** for reviewable infrastructure as code
+```text
+S3 -> Lambda
+```
 
-## What You Will Learn
-
-By building and reading this project, you should be able to explain:
-
-- why SQS sits between S3 and Lambda
-- how asynchronous retries differ from synchronous request handling
-- how dead-letter queues make failed work inspectable
-- how Lambda partial-batch failure reporting prevents successful SQS messages from being retried
-- how deterministic output keys make repeated events safer
-- how source ETags can be used to avoid unnecessary duplicate processing
-- how IAM permissions map to each step of the data flow
-- where backpressure appears when uploads outpace processing
-- which AWS resources create cost and how to clean them up
+That is perfectly valid for many workloads. We deliberately put **SQS in the middle** because the interesting part of this project is not image resizing. It is what happens when uploads arrive faster than your worker can process them, when one image keeps failing, or when AWS delivers the same event more than once.
 
 ## Architecture
 
@@ -40,85 +25,73 @@ flowchart LR
     D --> A["CloudWatch DLQ alarm"]
 ```
 
-### Why put SQS between S3 and Lambda?
+The services are intentionally limited to a few that each have a clear job:
 
-S3 can invoke Lambda directly, but the queue gives this learning architecture an explicit buffer.
+- **S3** stores the original and processed images.
+- **SQS** absorbs bursts and owns the retry boundary.
+- **Lambda** does the image work.
+- **CloudWatch** gives us logs, service metrics, and a DLQ alarm.
+- **IAM** keeps the worker scoped to the buckets and queue it actually needs.
+- **AWS SAM** makes the whole setup reviewable as code.
 
-That means:
+## Why SQS is here
 
-1. uploads do not require the processor to be immediately available
-2. bursts can wait in the queue instead of being lost
-3. failed messages can be retried independently
-4. messages that repeatedly fail can move to a DLQ for investigation
-5. Lambda concurrency can be controlled separately from the upload rate
+If S3 invokes Lambda directly, the architecture is shorter. With SQS between them, we get a place where unfinished work can wait.
 
-The trade-off is additional latency, another service to operate, and SQS request cost.
+That changes the failure model in useful ways:
 
-## Processing Flow
+- uploads do not depend on the processor being immediately available
+- bursts become queue depth instead of instant Lambda pressure
+- failed messages can be retried independently
+- poison messages eventually move to a DLQ
+- Lambda concurrency can be controlled without changing the producer
 
-1. A user uploads an object to the source S3 bucket.
-2. S3 sends an object-created event to the SQS queue.
-3. Lambda polls SQS in batches.
-4. The function decodes the S3 event contained in each SQS message.
-5. Unsupported file extensions are ignored rather than retried forever.
-6. For supported images, Lambda checks whether the deterministic output already exists for the same source ETag.
-7. If work is needed, Lambda downloads the image, validates its size, resizes it while preserving aspect ratio, converts it to JPEG, and uploads the result to the processed bucket.
-8. Successful SQS messages are deleted by the event-source mapping.
-9. Failed messages are returned through partial-batch failure reporting and retried.
-10. Messages that exceed the queue retry policy move to the DLQ.
+The trade-off is extra latency, extra configuration, and another AWS service to pay attention to. That trade-off is exactly what this repo is meant to teach.
 
-## Idempotency Strategy
+## What actually happens after an upload
 
-S3 and SQS are asynchronous systems, so duplicate delivery is possible.
+1. An image is uploaded to the source bucket.
+2. S3 sends an object-created event to SQS.
+3. Lambda polls the queue in small batches.
+4. The worker unwraps the S3 event from the SQS message.
+5. Unsupported extensions are acknowledged and skipped instead of being retried forever.
+6. For a supported image, the worker checks whether the deterministic output already exists for the same source ETag.
+7. If work is needed, it downloads the object and checks both compressed size and decoded pixel count.
+8. The image is resized while preserving aspect ratio, converted to JPEG, and written to the processed bucket.
+9. Successful SQS messages are removed automatically by the event-source mapping.
+10. Failed messages are returned through partial-batch failure reporting, so only the failed message is retried.
+11. A message that keeps failing is eventually moved to the DLQ.
 
-This project uses two simple techniques:
+## Two limits we would not skip
 
-- a **deterministic output key** derived from the source object key
-- the source object's **ETag stored as S3 object metadata**
+A 10 MiB file limit sounds like enough protection until you remember that compressed image size and decoded image size are different things.
 
-Before processing, the function checks the existing output. If its stored source ETag matches the incoming event, the function treats the message as already processed.
+A small compressed image can expand into a very large in-memory bitmap. In a Lambda function, that can turn into a memory problem quickly.
 
-This does not make every possible image workflow exactly-once. It demonstrates how to design operations so duplicate delivery is less harmful.
-
-## Repository Layout
+The worker therefore uses two separate limits:
 
 ```text
-.
-├── .github/workflows/ci.yml
-├── docs/
-│   ├── architecture.md
-│   └── troubleshooting.md
-├── events/
-│   └── sqs-s3-event.json
-├── src/
-│   ├── app.py
-│   └── requirements.txt
-├── tests/
-│   └── test_app.py
-├── .gitignore
-├── CONTRIBUTING.md
-├── pyproject.toml
-├── requirements-dev.txt
-├── template.yaml
-└── README.md
+MAX_IMAGE_BYTES   = 10 MiB
+MAX_IMAGE_PIXELS  = 20,000,000
 ```
 
-## Prerequisites
+The byte limit protects the download path. The pixel limit is checked after Pillow reads the image header but **before** the full image is decoded.
 
-For local validation:
+These are sensible defaults for a learning project, not universal production numbers. If you adapt this design, choose limits from your Lambda memory, expected formats, traffic, and failure policy.
 
-- Python 3.12+
-- pip
+## Duplicate events are normal
 
-For AWS deployment:
+This pipeline does not assume exactly-once delivery.
 
-- an AWS account
-- AWS CLI configured with credentials you control
-- AWS SAM CLI
+The output key is deterministic, and the processed object stores the source ETag in metadata. When the same source event arrives again, the worker can check the existing output and skip unnecessary work if the ETag matches.
 
-Deploying this project can create billable AWS resources.
+That makes duplicate delivery less harmful, but it is not magic exactly-once processing. Two matching events can still race, and an S3 ETag is not a universal content hash for every upload method.
 
-## Local Setup
+If a workflow genuinely needs stronger coordination, adding a DynamoDB processing ledger with conditional writes would be a reasonable next step. We left it out here because it would solve a different problem and make the base architecture harder to see.
+
+## Run it locally
+
+You need Python 3.12+ for the local checks.
 
 ```bash
 python -m venv .venv
@@ -133,7 +106,7 @@ On Windows PowerShell:
 pip install -r requirements-dev.txt
 ```
 
-Run the quality checks:
+Then run the same checks used in CI:
 
 ```bash
 ruff check .
@@ -143,9 +116,11 @@ sam validate --lint
 sam build
 ```
 
-## Deploy with AWS SAM
+## Deploy it
 
-First build the application:
+You will need an AWS account, AWS CLI credentials you control, and AWS SAM CLI.
+
+Build first:
 
 ```bash
 sam build
@@ -157,25 +132,21 @@ Then deploy interactively:
 sam deploy --guided
 ```
 
-SAM will ask for two globally unique S3 bucket names:
+SAM asks for two globally unique bucket names:
 
-- `UploadBucketName`
-- `ProcessedBucketName`
+```text
+UploadBucketName
+ProcessedBucketName
+```
 
-A practical naming pattern is:
+A naming pattern such as this is easier to reason about than random names:
 
 ```text
 your-unique-prefix-image-pipeline-uploads
 your-unique-prefix-image-pipeline-processed
 ```
 
-Do not use the example literally if someone else already owns those bucket names.
-
-## Try the Pipeline
-
-After deployment, read the stack outputs to find the source and processed bucket names.
-
-Upload a JPEG or PNG:
+After the stack is up, upload a JPEG or PNG:
 
 ```bash
 aws s3 cp ./photo.jpg s3://YOUR_UPLOAD_BUCKET/demo/photo.jpg
@@ -187,114 +158,122 @@ Then inspect the processed bucket:
 aws s3 ls s3://YOUR_PROCESSED_BUCKET/processed/ --recursive
 ```
 
-The processor writes JPEG output under a deterministic `processed/` prefix while preserving the source key path.
+The result is written as JPEG under a deterministic `processed/` path derived from the source key.
 
-## Failure Handling
+## Failure is part of the design
 
-The queue uses a retry policy before moving repeatedly failing messages to the DLQ.
+A corrupt image, an image above the byte or pixel limit, a temporary S3 problem, or an unexpected processor error should not quietly disappear.
 
-Examples of failures that can reach the DLQ include:
+The queue retries failed messages. After the configured receive limit, the message moves to the DLQ. A CloudWatch alarm watches for visible DLQ messages so the failure becomes something you can investigate.
 
-- corrupt image bytes
-- images above the configured size limit
-- temporary S3 permission/configuration errors
-- unexpected processor exceptions
+The alarm intentionally has no SNS destination. For a learning repo, we would rather make the alerting boundary obvious than pretend there is a complete incident-management system here.
 
-The Lambda handler uses **partial batch responses**. If a batch contains five SQS messages and only one fails, only that message should be retried.
+One detail worth noticing in the code is **partial batch failure reporting**. If Lambda receives five SQS messages and one fails, the handler reports only that message ID. The four successful messages do not need to be processed again.
 
-The template also creates a CloudWatch alarm that enters the `ALARM` state when the DLQ contains visible messages. It does not send notifications by itself; adding an SNS or incident-management destination is a useful extension exercise.
+## IAM choices
 
-## Security Notes
+The worker can:
 
-The template is intentionally conservative:
+- read source objects from the upload bucket
+- read existing outputs from the processed bucket for duplicate checks
+- write new objects to the processed bucket
+- poll only the image queue
 
-- both buckets block public access
-- S3 server-side encryption is enabled
-- SQS managed encryption is enabled
-- the SQS queue policy limits S3 `SendMessage` access to the configured upload bucket and AWS account
-- Lambda receives read access only to the upload bucket
-- Lambda receives read/write access only to the processed bucket
-- Lambda receives SQS polling permissions only for the image queue
-- no application secrets are stored in the repository
+The SQS queue policy allows S3 to send messages only from the configured upload bucket and AWS account.
 
-Before adapting this pattern for a real product, consider malware scanning, stricter content validation, object ownership requirements, KMS key policies, lifecycle policies, access logging, alarms with notification targets, and account-level guardrails.
+Both buckets block public access. S3 server-side encryption and SQS managed encryption are enabled. No AWS credentials belong in this repository.
 
-## Reliability and Scaling Notes
+## What this project does not pretend to solve
 
-### Backpressure
+This is an engineering learning project, not a finished image platform.
 
-If uploads arrive faster than Lambda can process them, SQS absorbs the difference. Queue depth and message age become important operational signals.
+Before using a similar design for real user uploads, we would still think about things such as malware scanning, content validation, lifecycle policies, KMS requirements, notification routing, access logging, account guardrails, and the security implications of the actual product.
 
-### Lambda concurrency
+We also deliberately did **not** add EventBridge, Step Functions, DynamoDB, SNS, CloudFront, or API Gateway just to make the diagram look more impressive. Each of those can be useful, but none is required to understand the core queue-based processing pattern.
 
-The SAM template caps SQS-triggered Lambda concurrency so a sudden upload burst does not create unconstrained processing concurrency.
+## Backpressure and scaling
 
-### Visibility timeout
+If uploads arrive faster than Lambda can process them, SQS holds the backlog. Queue depth and message age then become useful signals instead of hidden pressure.
 
-The queue visibility timeout is longer than the Lambda timeout. This reduces the chance of the same message becoming visible while the current invocation is still processing it.
+The SAM template caps SQS-triggered Lambda concurrency at five. There is nothing special about five. It is a teaching safeguard that keeps a learner deployment bounded while still showing how consumer concurrency can be controlled independently from upload rate.
 
-### Poison messages
+The queue visibility timeout is also longer than the Lambda timeout so a message is less likely to become visible again while its current invocation is still working.
 
-Messages that repeatedly fail move to the DLQ instead of retrying forever.
+## Cost and cleanup
 
-## Cost Awareness
+This project can create billable AWS resources. The main cost drivers are S3 storage and requests, SQS requests, Lambda duration and invocations, CloudWatch usage, and any data transfer your test generates.
 
-Potential charges include:
+We do not put a fake monthly price in the README because region, traffic, object size, and current AWS pricing all change the answer.
 
-- S3 storage and requests
-- SQS requests
-- Lambda invocations, duration, and memory
-- CloudWatch logs, metrics, and alarms
-- data transfer depending on how the project is used
-
-For a small learning workload the cost can be low, but it is not guaranteed to be free. Check current AWS pricing for your region before deployment.
-
-## Clean Up
-
-Empty both S3 buckets before deleting the stack, because CloudFormation cannot delete non-empty buckets.
+When you are finished, empty both buckets first:
 
 ```bash
 aws s3 rm s3://YOUR_UPLOAD_BUCKET --recursive
 aws s3 rm s3://YOUR_PROCESSED_BUCKET --recursive
+```
+
+Then delete the stack:
+
+```bash
 sam delete
 ```
 
-Also inspect the DLQ if you intentionally generated failures while learning.
+CloudFormation cannot remove a non-empty S3 bucket, which is why cleanup is a two-step process here.
 
-## Useful Extension Challenges
+## If you want to push it further
 
-1. publish DLQ alarms to SNS
-2. add image dimensions and processing duration as custom metrics
-3. add a DynamoDB processing ledger and compare it with the ETag approach
-4. add object lifecycle rules to control storage cost
-5. support WebP output and compare size/quality trade-offs
-6. separate thumbnail and full-size processing queues
-7. add reserved concurrency and load-test the backpressure behavior
-8. add a quarantine path for invalid or suspicious files
-9. use a customer-managed KMS key and document the key policy
-10. add EventBridge for richer event routing and explain when it is preferable to direct S3 notifications
+Good next experiments are the ones that change an engineering decision rather than just add another logo to the diagram:
 
-## Interview Questions
+1. Add an SNS destination to the DLQ alarm and decide who should receive it.
+2. Add a queue-age alarm and compare it with simply watching queue depth.
+3. Replace the ETag duplicate check with a DynamoDB processing ledger and document what improves and what becomes more complex.
+4. Add lifecycle rules and measure how they change storage cost over time.
+5. Add WebP output and compare quality, size, and processing time with JPEG.
+6. Load-test the queue and experiment with Lambda concurrency while watching message age.
 
-After completing the project, try answering these without reading the code:
+## Questions worth being able to answer
 
-1. Why use SQS instead of invoking Lambda directly from S3?
-2. What happens when the Lambda function fails three times for the same message?
-3. Why should the SQS visibility timeout exceed the Lambda timeout?
-4. What problem does partial-batch failure reporting solve?
-5. Why can duplicate processing happen in an event-driven system?
-6. How does this project reduce the impact of duplicate S3 events?
-7. What happens if image uploads arrive faster than Lambda can process them?
-8. Which IAM permissions does Lambda actually need?
-9. How would you detect a growing processing backlog?
-10. What would you change before adapting this design for sensitive user uploads?
+After you build the project, try explaining these without opening the README:
+
+- Why is SQS between S3 and Lambda instead of using direct invocation?
+- What happens to one bad image in a batch of otherwise valid messages?
+- Why must the SQS visibility timeout be longer than the Lambda timeout?
+- Why is a compressed-byte limit not enough for image safety?
+- Where can duplicate processing still happen despite the ETag check?
+- What signal would tell you the processor is falling behind uploads?
+- Which IAM permissions belong to Lambda, and which permission belongs to S3?
+- What would you add first if this pipeline started receiving untrusted customer uploads?
+
+## Repository layout
+
+```text
+.
+├── .github/workflows/ci.yml
+├── docs/
+│   ├── architecture.md
+│   └── troubleshooting.md
+├── events/
+│   └── sqs-s3-event.json
+├── src/
+│   ├── app.py
+│   └── requirements.txt
+├── tests/
+│   └── test_app.py
+├── CONTRIBUTING.md
+├── pyproject.toml
+├── requirements-dev.txt
+├── template.yaml
+└── README.md
+```
+
+For failure investigation, see [`docs/troubleshooting.md`](docs/troubleshooting.md). For the deeper architecture trade-offs, see [`docs/architecture.md`](docs/architecture.md).
 
 ## About YourCloudDude
 
-YourCloudDude creates practical AWS, cloud, and Python projects focused on understanding real engineering decisions through implementation.
+**YourCloudDude** builds practical AWS, cloud, and Python projects around one idea: the code matters, but understanding why the system is shaped that way matters more.
 
-**Website:** https://yourclouddude.com/
+Website: https://yourclouddude.com/
 
 ---
 
-**Build it. Understand it. Explain it.**
+Build it, break a message on purpose, watch it retry, inspect the DLQ, and then change one design decision. That will teach you more about event-driven AWS than simply getting a green deployment once.

@@ -18,6 +18,7 @@ LOGGER.setLevel(logging.INFO)
 OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET", "")
 MAX_DIMENSION = int(os.environ.get("MAX_DIMENSION", "1024"))
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "20000000"))
 SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 _s3_client: Any | None = None
@@ -65,8 +66,15 @@ def is_already_processed(s3: Any, output_key: str, source_etag: str) -> bool:
     return existing_etag == source_etag
 
 
+def validate_pixel_count(width: int, height: int) -> None:
+    pixels = width * height
+    if pixels > MAX_IMAGE_PIXELS:
+        raise ValueError(f"image exceeds {MAX_IMAGE_PIXELS} pixel limit")
+
+
 def resize_to_jpeg(payload: bytes) -> tuple[bytes, int, int]:
     with Image.open(BytesIO(payload)) as source:
+        validate_pixel_count(source.width, source.height)
         source.load()
         source.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.Resampling.LANCZOS)
         converted = source.convert("RGB")
