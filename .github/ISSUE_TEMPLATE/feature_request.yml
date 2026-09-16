@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose an improvement to the event-driven image pipeline
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or learning goal
+      description: What limitation, failure mode, or engineering question should this feature address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Describe the smallest useful change.
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Trade-offs
+      description: What changes in latency, retries, concurrency, cost, failure behavior, or IAM surface?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - S3 / storage
+        - SQS / queueing
+        - Lambda / processing
+        - DLQ / failure handling
+        - IAM / security
+        - Observability / CloudWatch
+        - Infrastructure / SAM
+        - Documentation / learning experience
+    validations:
+      required: true
