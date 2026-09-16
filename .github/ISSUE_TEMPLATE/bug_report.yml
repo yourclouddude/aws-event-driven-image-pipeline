@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible problem in the event-driven image pipeline
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Do not include AWS credentials, tokens, real customer uploads, or other sensitive data.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the upload/event/queue sequence that triggers the issue.
+      placeholder: |
+        1. Upload ...
+        2. Observe SQS/Lambda ...
+        3. Check processed bucket or DLQ ...
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Python, AWS SAM CLI, AWS Region, and OS versions when relevant.
+      placeholder: "Python 3.12, SAM CLI ..., eu-west-1, Linux"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs, event samples, or output
+      description: Redact account IDs, credentials, bucket names if sensitive, and personal data.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, tokens, and sensitive data from this report.
+          required: true
+        - label: I checked the existing issues before opening this one.
+          required: true
